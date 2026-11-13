@@ -1,146 +1,125 @@
-# Quantile forecaster for Polymarket's "Next CEO of NVIDIA?" event prices (standard library only, deterministic).
-# For each market it builds the empirical distribution of h-minute price changes from the market's own recent
-# history (recency weighted), blends it with a pooled, volatility-scaled distribution, and writes five quantiles
-# for each of the next 240 minutes.
-import json, math, os, glob
-
-QS = [0.05, 0.25, 0.5, 0.75, 0.95]
-H = 240
-HGRID = [1, 2, 3, 5, 8, 12, 18, 27, 40, 60, 90, 130, 180, 240]
-
-# tunable parameters
-P = {
-    "halflife": 400.0,   # minutes, recency weight of history windows
-    "own_w": 0.3,        # weight of the market's own change distribution vs pooled
-    "widen": 0.7,       # overall spread multiplier
-    "widen_tail": 0.65,  # spread multiplier of the 5% / 95% quantiles
-    "floor_sig": 0.0006,  # minimum per-sqrt-minute sigma (price units)
-}
-
-
-def wquantiles(vals, wts, qs):
-    idx = sorted(range(len(vals)), key=lambda i: vals[i])
-    tot = sum(wts)
-    out = []
-    cum = 0.0
-    k = 0
-    cums = []
-    for i in idx:
-        cum += wts[i]
-        cums.append(cum)
-    for q in qs:
-        target = q * tot
-        while k < len(idx) - 1 and cums[k] < target:
-            k += 1
-        out.append(vals[idx[k]])
-    return out
-
-
-def deltas(prices, h, halflife):
-    n = len(prices)
-    if n <= h + 1:
-        return None, None
-    vals, wts = [], []
-    lam = math.log(2) / halflife
-    stride = max(1, h // 4)
-    start = (n - 1 - h) % stride
-    for i in range(start, n - h, stride):
-        vals.append(prices[i + h] - prices[i])
-        wts.append(math.exp(-lam * (n - 1 - (i + h))))
-    return vals, wts
-
-
-def recent_sigma(prices):
-    n = len(prices)
-    w = prices[max(0, n - 721):]
-    if len(w) < 30:
-        w = prices
-    s = 0.0
-    c = 0
-    for a, b in zip(w, w[1:]):
-        s += (b - a) ** 2
-        c += 1
-    if c == 0:
-        return P["floor_sig"]
-    return max(P["floor_sig"], math.sqrt(s / c))
-
-
-def forecast_market(prices, pooled):
-    x = prices[-1]
-    sig = recent_sigma(prices)
-    zs = [-1.644854, -0.67449, 0.0, 0.67449, 1.644854]
-    grid = {}
-    for h in HGRID:
-        own, wts = deltas(prices, h, P["halflife"])
-        # parametric fallback / pooled component: normalised pooled quantiles times sigma sqrt(h)
-        pooled_q = [pooled[h][j] * sig * math.sqrt(h) for j in range(5)]
-        if own is None or len(own) < 20:
-            q = pooled_q
-        else:
-            oq = wquantiles(own, wts, QS)
-            wo = P["own_w"]
-            q = [wo * oq[j] + (1 - wo) * pooled_q[j] for j in range(5)]
-        # separate spread multipliers: inner quantiles (25/75) and tails (5/95)
-        mult = [P["widen_tail"], P["widen"], 1.0, P["widen"], P["widen_tail"]]
-        grid[h] = [v * m for v, m in zip(q, mult)]
-    rows = []
-    for h in range(1, H + 1):
-        # interpolate between grid horizons
-        lo = max(g for g in HGRID if g <= h)
-        hi = min(g for g in HGRID if g >= h)
-        if lo == hi:
-            q = grid[lo]
-        else:
-            t = (h - lo) / (hi - lo)
-            q = [grid[lo][j] * (1 - t) + grid[hi][j] * t for j in range(5)]
-        row = [min(1.0, max(0.0, x + d)) for d in q]
-        for j in range(1, 5):
-            if row[j] < row[j - 1]:
-                row[j] = row[j - 1]
-        rows.append([round(v, 6) for v in row])
-    return rows
-
-
-def build_pooled(markets):
-    """Pooled normalised h-step change quantiles: change / (sigma*sqrt(h)), across markets with enough history."""
-    pooled = {}
-    for h in HGRID:
-        vals, wts = [], []
-        for prices in markets:
-            if len(prices) < h + 60:
-                continue
-            sig = recent_sigma(prices)
-            d, w = deltas(prices, h, P["halflife"])
-            if d is None:
-                continue
-            sc = sig * math.sqrt(h)
-            vals.extend(v / sc for v in d)
-            wts.extend(w)
-        if len(vals) >= 50:
-            pooled[h] = wquantiles(vals, wts, QS)
-        else:
-            pooled[h] = [z * 1.0 for z in (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)]
-    return pooled
-
-
-def forecast_case(case):
-    series = [m["prices"] for m in case["markets"]]
-    pooled = build_pooled(series)
-    return {"forecasts": [{"id": m["id"], "q": forecast_market(m["prices"], pooled)} for m in case["markets"]]}
-
-
+import os,json,http.client as H
+from urllib.parse import urlparse
+V=dict(P=100,N=320,B=330,R=500,Q=900,K=20000)
+T={}
+for p in V:
+ t=[0]*120
+ for r in range(8):
+  for c in range(8):
+   m=min(r,7-r)+min(c,7-c);x=V[p]
+   if p=='P':x+=(6-r)*7+(c in(3,4))*(7-r)*4
+   if p=='N':x+=m*9-(r==7)*15
+   if p=='B':x+=m*5
+   if p=='R':x+=(r==1)*20+(c in(3,4))*5
+   if p=='Q':x+=m*2
+   if p=='K':x+=(r==7)*20+(r==7)*(c in(1,2,6))*20-m*4*(r<6)
+   t[21+c+10*r]=x
+ T[p]=t
+Z=(-10,-1,1,10);X=(-11,-9,9,11)
+D=dict(P=(-10,-20,-11,-9),N=(-21,-19,-12,-8,8,12,19,21),B=X,R=Z,Q=Z+X,K=Z+X)
+def gen(b):
+ for i,p in enumerate(b):
+  if p.isupper():
+   for d in D[p]:
+    j=i+d
+    while 1:
+     q=b[j]
+     if q.isspace()or q.isupper():break
+     if p=='P':
+      if d%10==0 and q!='.':break
+      if d==-20 and(i<81 or b[i-10]!='.'):break
+      if d%10 and q=='.':break
+     yield i,j
+     if p in'PNK'or q.islower():break
+     j+=d
+def rot(b):return b[::-1].swapcase()
+def ev(b):return sum(T[p][i]if p.isupper()else-T[p.upper()][119-i]for i,p in enumerate(b)if p.isalpha())
+def chk(b):
+ f=rot(b);return any(f[j]=='k'for i,j in gen(f))
+class A(Exception):pass
+TT={};N=0;LIM=0
+def S(b,sc,d,a,be,ply,nm=1):
+ global N
+ N+=1
+ if N>LIM:raise A
+ e=TT.get(b);mv=None
+ if e:
+  if e[0]>=d and(e[1]==0 or e[1]==1 and e[2]>=be or e[1]==2 and e[2]<=a):return e[2]
+  mv=e[3]
+ a0=a;best=-99999
+ if d<=0:
+  best=sc
+  if best>=be:return best
+  a=max(a,best)
+ elif nm and d>2 and sc>=be:
+  v=-S(rot(b),-sc,d-3,-be,-be+1,ply+1,0)
+  if v>=be:return v
+ L=[]
+ for i,j in gen(b):
+  q=b[j]
+  if q=='k':return 29000
+  if d<=0 and q=='.':continue
+  s=T[b[i]][j]-T[b[i]][i]
+  if q!='.':s+=T[q.upper()][119-j]
+  pr=b[i]=='P'and j<30
+  if pr:s+=T['Q'][j]-T['P'][j]
+  L.append((((i,j)==mv)*9999+s,i,j,pr))
+ L.sort(reverse=1)
+ bm=None;n=0
+ for s,i,j,pr in L:
+  nb=list(b);nb[j]='Q'if pr else b[i];nb[i]='.'
+  sc2=sc+s-((i,j)==mv)*9999
+  v=-S(rot(''.join(nb)),-sc2,d-1,-be,-a,ply+1)
+  n+=1
+  if v>best:best=v;bm=(i,j)
+  if v>a:a=v
+  if a>=be:break
+ if d>0 and best<-28000:
+  best=-29000+ply if chk(b)else 0
+ TT[b]=(d,0 if a0<best<be else 1 if best>=be else 2,best,bm)
+ return best
+def parse(fen):
+ f=fen.split();b=' '*20
+ for row in f[0].split('/'):
+  b+=' '+''.join('.'*int(c)if c.isdigit()else c for c in row)+' '
+ b+=' '*20
+ return b,f[1]=='b'
+def sq(s,fl):
+ i=21+ord(s[0])-97+10*(8-int(s[1]));return 119-i if fl else i
+def pick(fen,legal,seen,bud):
+ global N,LIM
+ b,fl=parse(fen)
+ if fl:b=rot(b)
+ R=[]
+ for u in legal:
+  i=sq(u[:2],fl);j=sq(u[2:4],fl);p=b[i];nb=list(b);nb[j]=u[4].upper()if len(u)>4 else p;nb[i]='.'
+  if p=='K'and abs(j-i)==2:
+   k=(i+3,i+1)if j>i else(i-4,i-1);nb[k[0]]='.';nb[k[1]]='R'
+  if p=='P'and abs(j-i)in(9,11)and b[j]=='.':nb[j+10]='.'
+  c=rot(''.join(nb));R.append((u,c,ev(c)))
+ best=R[0][0];LIM=bud;N=0
+ try:
+  for d in range(1,30):
+   a=-99999;cur=[];bk=0
+   for k,(u,c,e)in enumerate(R):
+    v=0 if c in seen else-S(c,e,d-1,-99999,-a,1)
+    cur.append((v,k))
+    if v>a:a=v;bk=k
+   R=[R[bk]]+[R[k]for v,k in sorted(cur,reverse=1)if k!=bk];best=R[0][0]
+   if a>20000:break
+ except A:pass
+ for u,c,e in R:
+  if u==best:seen.add(c);break
+ return best
 def main():
-    indir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(outdir, exist_ok=True)
-    for path in sorted(glob.glob(os.path.join(indir, "*.in"))):
-        with open(path, encoding="utf-8") as f:
-            case = json.load(f)
-        res = forecast_case(case)
-        name = os.path.basename(path)[:-3] + ".out"
-        with open(os.path.join(outdir, name), "w", encoding="utf-8") as f:
-            json.dump(res, f, separators=(",", ":"))
-
-
-if __name__ == "__main__":
-    main()
+ u=urlparse(os.environ['MAKEFUN_ENV_URL']);c=H.HTTPConnection(u.hostname,u.port)
+ def post(p,b):
+  c.request('POST',p,json.dumps(b),{'content-type':'application/json'});return json.loads(c.getresponse().read())
+ g=post('/game',{});cur=None;seen=set()
+ while g.get('status')!='done':
+  if g['status']=='your_move':
+   if g['game']!=cur:cur=g['game'];seen=set();TT.clear()
+   g=post('/move',{'game':cur,'move':pick(g['fen'],g['legal_moves'],seen,BUD)})
+  else:g=post('/game',{})
+BUD=100000
+main()
