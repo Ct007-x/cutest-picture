@@ -12,7 +12,8 @@ HGRID = [1, 2, 3, 5, 8, 12, 18, 27, 40, 60, 90, 130, 180, 240]
 P = {
     "halflife": 400.0,   # minutes, recency weight of history windows
     "own_w": 0.3,        # weight of the market's own change distribution vs pooled
-    "widen": 0.75,        # overall spread multiplier
+    "widen": 0.7,       # overall spread multiplier
+    "widen_tail": 0.65,  # spread multiplier of the 5% / 95% quantiles
     "floor_sig": 0.0006,  # minimum per-sqrt-minute sigma (price units)
 }
 
@@ -79,7 +80,9 @@ def forecast_market(prices, pooled):
             oq = wquantiles(own, wts, QS)
             wo = P["own_w"]
             q = [wo * oq[j] + (1 - wo) * pooled_q[j] for j in range(5)]
-        grid[h] = [v * P["widen"] for v in q]
+        # separate spread multipliers: inner quantiles (25/75) and tails (5/95)
+        mult = [P["widen_tail"], P["widen"], 1.0, P["widen"], P["widen_tail"]]
+        grid[h] = [v * m for v, m in zip(q, mult)]
     rows = []
     for h in range(1, H + 1):
         # interpolate between grid horizons
